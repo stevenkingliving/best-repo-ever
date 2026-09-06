@@ -1,0 +1,8 @@
+frames/
+*.jpg
+*.wav
+*.mp4
+*.log
+flash.filter
+lightning.json
+node_modules/

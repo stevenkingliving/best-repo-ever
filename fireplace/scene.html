@@ -1,0 +1,405 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Fireplace</title>
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style></head>
+<body><canvas id="c"></canvas>
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 a; void main(){ gl_Position = vec4(a,0.0,1.0); }
+</script>
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2 uRes;      // resolution
+uniform float uTime;    // seconds
+uniform float uFlash;   // lightning flash intensity 0..1
+
+// ---------- hashing / noise ----------
+float hash11(float p){ p = fract(p*0.1031); p *= p+33.33; p *= p+p; return fract(p); }
+vec3 hash33(vec3 p3){ p3 = fract(p3*vec3(0.1031,0.1030,0.0973)); p3 += dot(p3, p3.yxz+33.33); return fract((p3.xxy+p3.yxx)*p3.zyx); }
+float hash13(vec3 p3){ p3 = fract(p3*0.1031); p3 += dot(p3, p3.zyx+31.32); return fract((p3.x+p3.y)*p3.z); }
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*0.1031); p3 += dot(p3, p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+
+// gradient noise 3D
+float gnoise(vec3 p){
+  vec3 i = floor(p); vec3 f = fract(p);
+  vec3 u = f*f*f*(f*(f*6.0-15.0)+10.0);
+  float n = 0.0;
+  for(int z=0;z<2;z++) for(int y=0;y<2;y++) for(int x=0;x<2;x++){
+    vec3 o = vec3(float(x),float(y),float(z));
+    vec3 g = hash33(i+o)*2.0-1.0;
+    float d = dot(g, f-o);
+    vec3 w = mix(1.0-u, u, o);
+    n += d*w.x*w.y*w.z;
+  }
+  return n; // ~[-0.7,0.7]
+}
+float vnoise(vec3 p){
+  vec3 i = floor(p); vec3 f = fract(p); vec3 u = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash13(i),hash13(i+vec3(1,0,0)),u.x),mix(hash13(i+vec3(0,1,0)),hash13(i+vec3(1,1,0)),u.x),u.y),
+             mix(mix(hash13(i+vec3(0,0,1)),hash13(i+vec3(1,0,1)),u.x),mix(hash13(i+vec3(0,1,1)),hash13(i+vec3(1,1,1)),u.x),u.y),u.z);
+}
+float fbm(vec3 p){
+  float a=0.5, s=0.0; 
+  for(int i=0;i<5;i++){ s += a*gnoise(p); p = p*2.03 + vec3(1.7,9.2,3.1); a*=0.5; }
+  return s;
+}
+float fbm3(vec3 p){
+  float a=0.5, s=0.0;
+  for(int i=0;i<3;i++){ s += a*gnoise(p); p = p*2.03 + vec3(1.7,9.2,3.1); a*=0.5; }
+  return s;
+}
+float fbmv(vec3 p){
+  float a=0.5, s=0.0;
+  for(int i=0;i<4;i++){ s += a*vnoise(p); p = p*2.02 + 7.3; a*=0.5; }
+  return s;
+}
+
+// ---------- utilities ----------
+float sdCapsule(vec2 p, vec2 a, vec2 b, float r){ vec2 pa=p-a, ba=b-a; float h=clamp(dot(pa,ba)/dot(ba,ba),0.0,1.0); return length(pa-ba*h)-r; }
+float sdBox(vec2 p, vec2 b){ vec2 d=abs(p)-b; return length(max(d,0.0))+min(max(d.x,d.y),0.0); }
+
+// blackbody-ish flame ramp
+vec3 fireRamp(float t){
+  t = clamp(t,0.0,1.0);
+  vec3 c = vec3(0.0);
+  c = mix(vec3(0.0), vec3(0.55,0.04,0.0), smoothstep(0.0,0.25,t));
+  c = mix(c, vec3(1.0,0.28,0.02), smoothstep(0.22,0.5,t));
+  c = mix(c, vec3(1.0,0.66,0.12), smoothstep(0.48,0.75,t));
+  c = mix(c, vec3(1.0,0.93,0.65), smoothstep(0.72,1.0,t));
+  return c;
+}
+
+// global flicker (slow, multi-frequency)
+float flicker(float t){
+  return 0.78 + 0.12*sin(t*3.1) + 0.06*sin(t*7.7+1.0) + 0.04*sin(t*13.3+2.0) + 0.09*(fbmv(vec3(t*1.4,0.0,3.0))-0.5)*2.0;
+}
+
+// ---------- flame field ----------
+// One shared turbulent field per layer; several soft "source" envelopes shape it into a single fire.
+float turb(vec2 q, float t, float seed){
+  vec3 np = vec3(q.x*5.5, q.y*3.2 - t*2.2, seed*9.0 + t*0.25);
+  vec2 warp = vec2(fbm3(np*0.7 + vec3(3.0,0.0,0.0)), fbm3(np*0.7 + vec3(0.0,11.0,4.0)));
+  float n = fbm(np + vec3(warp*1.3, 0.0));
+  // add fine flicker detail
+  n += 0.18*gnoise(np*3.1 + vec3(0.0, -t*2.0, 0.0));
+  return n*0.5+0.5;
+}
+float envelope(vec2 p, vec2 base, float width, float height, float t, float seed){
+  vec2 q = p - base;
+  float yn = q.y/height;
+  if(yn < -0.35 || yn > 1.6) return 0.0;
+  float w = width*(1.0 - 0.5*clamp(yn,0.0,1.0))*(1.0 + 0.12*sin(t*1.7+seed));
+  float sway = (0.09*yn*yn*sin(t*1.9+seed*3.0) + 0.05*yn*sin(t*4.7+seed*1.3))*height;
+  q.x -= sway;
+  float sx = 1.0 - smoothstep(0.0, 1.0, abs(q.x)/max(w,1e-3));
+  float sy = 1.0 - smoothstep(-0.35, 1.25, yn);
+  sy *= smoothstep(-0.35, 0.05, yn);
+  return sx*sy;
+}
+struct Flames { float dens; float temp; float alpha; };
+Flames shapeFlames(vec2 p, float env, float n, float baseY){
+  Flames F;
+  float h = clamp((p.y-baseY)/0.7, 0.0, 1.5);
+  float d = env*1.35 + (n-0.5)*2.0 - 0.38 - h*0.6;
+  d = clamp(d*1.15, 0.0, 1.0);
+  F.dens = d;
+  // temperature: hot near base & core, cools with height and thin density
+  F.temp = clamp(d*(1.05 - 0.8*h) + 0.08*(1.0-h), 0.0, 1.0);
+  F.alpha = smoothstep(0.0, 0.45, d);
+  return F;
+}
+// back layer (behind front logs)
+Flames flamesBack(vec2 p, float t){
+  float e = 0.0;
+  e += envelope(p, vec2(-0.34, 0.25), 0.15, 0.50, t, 1.0);
+  e += envelope(p, vec2(-0.08, 0.28), 0.19, 0.66, t*1.04, 2.0);
+  e += envelope(p, vec2( 0.20, 0.27), 0.16, 0.56, t*0.96, 3.0);
+  e += 0.8*envelope(p, vec2( 0.42, 0.23), 0.11, 0.38, t*1.1, 4.0);
+  e += 0.55*envelope(p, vec2( 0.00, 0.24), 0.48, 0.22, t*0.9, 9.0); // broad shared base
+  e = clamp(e, 0.0, 1.2);
+  float n = turb(p, t, 1.0);
+  return shapeFlames(p, e, n, 0.22);
+}
+// front layer (in front of front log, low & lively)
+Flames flamesFront(vec2 p, float t){
+  float e = 0.0;
+  e += 0.85*envelope(p, vec2(-0.22, 0.18), 0.12, 0.32, t*1.13, 5.0);
+  e += 0.85*envelope(p, vec2( 0.07, 0.16), 0.15, 0.38, t*1.07, 6.0);
+  e += 0.7*envelope(p, vec2( 0.33, 0.17), 0.10, 0.26, t*1.19, 7.0);
+  e += 0.55*envelope(p, vec2(-0.45, 0.14), 0.08, 0.20, t*1.02, 8.0);
+  e += 0.35*envelope(p, vec2( 0.05, 0.15), 0.40, 0.14, t*1.0, 10.0);
+  e = clamp(e, 0.0, 1.2);
+  float n = turb(p+vec2(0.37,0.0), t*1.1, 2.0);
+  return shapeFlames(p, e, n, 0.14);
+}
+vec3 flameColor(Flames F){
+  vec3 c = fireRamp(F.dens*0.40 + F.temp*0.52);
+  return c;
+}
+void blendFlames(inout vec3 col, Flames F, float gain){
+  vec3 fc = flameColor(F)*gain;
+  float a = F.alpha;
+  col = col*(1.0 - a*0.5) + fc*a*1.25;
+  col += vec3(1.0,0.86,0.55)*pow(clamp(F.dens-0.7,0.0,1.0),1.5)*0.9*gain;
+}
+
+// scalar fire light intensity for illuminating the scene (cheap sample of flicker + position)
+float fireLight(vec2 p, float t){
+  vec2 c = vec2(-0.02, 0.35);
+  float r = length((p-c)*vec2(1.0,1.3));
+  return flicker(t) * (1.0/(1.0+6.0*r*r));
+}
+
+// ---------- brick wall ----------
+vec3 brickWall(vec2 p, float light, float t, out float ao){
+  // p scaled: brick 0.16 x 0.075
+  vec2 bs = vec2(0.17, 0.078);
+  vec2 q = p; 
+  float row = floor(q.y/bs.y);
+  q.x += mod(row,2.0)*bs.x*0.5;
+  vec2 cell = floor(q/bs);
+  vec2 f = fract(q/bs);
+  float id = hash12(cell+vec2(7.0,13.0));
+  // mortar mask with bevel
+  vec2 m = vec2(0.055, 0.11);
+  float ex = smoothstep(0.0, m.x, f.x)*smoothstep(0.0, m.x, 1.0-f.x);
+  float ey = smoothstep(0.0, m.y, f.y)*smoothstep(0.0, m.y, 1.0-f.y);
+  float brick = ex*ey;
+  vec3 bcol = mix(vec3(0.42,0.18,0.12), vec3(0.55,0.30,0.20), id);
+  bcol *= 0.85 + 0.3*fbmv(vec3(p*35.0, id*10.0));
+  bcol *= 0.9 + 0.2*hash12(cell*3.1);
+  vec3 mortar = vec3(0.32,0.29,0.26)*(0.8+0.4*fbmv(vec3(p*60.0,1.0)));
+  vec3 col = mix(mortar, bcol, brick);
+  // soot: darker toward center-top
+  float soot = smoothstep(0.15, 0.85, p.y) * (1.0 - smoothstep(0.1, 0.9, abs(p.x)));
+  soot = clamp(soot + 0.35*fbmv(vec3(p*3.0, 5.0)) - 0.25, 0.0, 1.0);
+  col = mix(col, vec3(0.05,0.04,0.035), soot*0.85);
+  // fake normal shading from bevel
+  float nx = (smoothstep(0.0,m.x,f.x) - smoothstep(0.0,m.x,1.0-f.x));
+  float ny = (smoothstep(0.0,m.y,f.y) - smoothstep(0.0,m.y,1.0-f.y));
+  vec2 toLight = normalize(vec2(-0.02,0.35) - p);
+  float shade = 1.0 + 0.35*(nx*toLight.x + ny*toLight.y)*brick;
+  ao = brick*0.3+0.7;
+  return col*shade;
+}
+
+// ---------- logs ----------
+vec4 logShape(vec2 p, vec2 a, vec2 b, float r, float t, float seed, float light){
+  float d = sdCapsule(p, a, b, r);
+  float cov = 1.0 - smoothstep(-0.004, 0.004, d);
+  if(cov <= 0.0) return vec4(0.0);
+  vec2 ba = normalize(b-a); vec2 nrm = vec2(-ba.y, ba.x);
+  float along = dot(p-a, ba);
+  float across = clamp(dot(p-a, nrm)/r, -1.0, 1.0); // -1..1
+  float nz = sqrt(max(0.0, 1.0-across*across));
+  float ang = asin(across); // unwrap the cylinder for texturing
+  // bark: deep longitudinal grooves + fine fibre
+  float grooves = fbmv(vec3(along*9.0, ang*7.0 + seed*4.0, seed));
+  float fibre = vnoise(vec3(along*140.0, ang*22.0, seed*2.0));
+  float ridge = smoothstep(0.35, 0.65, grooves);
+  vec3 barkCol = mix(vec3(0.16,0.10,0.06), vec3(0.36,0.24,0.14), ridge);
+  barkCol *= 0.75 + 0.5*fibre;
+  // ash-grey burnt patches
+  float ashN = fbmv(vec3(along*6.0, ang*3.0, seed*3.0+5.0));
+  float ashy = smoothstep(0.55, 0.75, ashN);
+  barkCol = mix(barkCol, vec3(0.45,0.42,0.40)*(0.7+0.3*fibre), ashy*0.8);
+  // char: heaviest on the top/inner (flame-facing) surfaces and near the middle of the log
+  float charN = fbmv(vec3(along*5.0, ang*2.5, seed*3.0+1.0));
+  float ch = smoothstep(0.25, 0.75, charN*0.8 + 0.25*across + 0.15);
+  vec3 col = mix(barkCol, vec3(0.03,0.025,0.02)*(0.6+0.8*fibre), ch);
+  // alligator char cracks: noise-distorted cells, only some cells glow, only where charred
+  vec2 cellUV = vec2(along*9.0, ang*3.2 + seed*3.0);
+  cellUV += 0.35*(vec2(fbmv(vec3(along*7.0, ang*4.0, seed+20.0)), fbmv(vec3(along*7.0+3.0, ang*4.0, seed+30.0))) - 0.5);
+  vec2 cid = floor(cellUV); vec2 cf = fract(cellUV);
+  float edge = min(min(cf.x, 1.0-cf.x)*0.9, min(cf.y, 1.0-cf.y)*1.6);
+  float crack = 1.0 - smoothstep(0.03, 0.13, edge);
+  crack *= smoothstep(0.45, 0.8, ch);
+  float glowCell = step(0.55, hash12(cid*1.7+seed*3.1));    // roughly 45% of cracks glow
+  float pulse = 0.5 + 0.5*sin(t*1.5 + seed*4.0 + hash12(cid)*6.28);
+  pulse *= 0.55 + 0.45*vnoise(vec3(t*1.1, along*4.0, seed));
+  vec3 ember = mix(vec3(0.8,0.08,0.0), vec3(1.0,0.5,0.1), pulse) * (0.35+pulse);
+  float glowMask = smoothstep(-0.3, 0.8, across) * (0.5 + 0.5*fbmv(vec3(along*3.0, t*0.4, seed+9.0)));
+  col = mix(col, vec3(0.015,0.01,0.01), crack*0.7);            // dark fissures
+  col += ember*crack*glowCell*1.3*glowMask;                    // glowing ones
+  // charred surface facing the flames glows dull red
+  float underGlow = ch * smoothstep(0.2, 1.0, across) * (0.5+0.5*fbmv(vec3(along*7.0, t*1.2, seed)));
+  col += vec3(1.0,0.25,0.03)*underGlow*0.35*flicker(t*1.3+seed);
+  // lighting: flames above/behind, so the upper half is lit; lower half falls into shadow
+  float lit = 0.18 + 0.82*clamp(across*0.6+0.5, 0.0, 1.0)*(0.4+0.6*nz);
+  col *= (0.30 + light*1.5*lit);
+  col *= 0.55 + 0.45*nz;                          // cylindrical roll-off
+  col *= 1.0 - 0.35*smoothstep(-0.55, -1.0, across); // dark underside
+  return vec4(col, cov);
+}
+
+// ---------- ember bed ----------
+vec3 emberBed(vec2 p, float t, float light){
+  // ash: pale grey with lumps
+  float ash = fbmv(vec3(p*22.0, 2.0));
+  vec3 col = mix(vec3(0.10,0.09,0.085), vec3(0.24,0.22,0.20), ash) * (0.3+light*1.2);
+  // glowing coals under logs
+  float coalMask = 1.0 - smoothstep(0.35, 0.75, abs(p.x));
+  float coalN = fbmv(vec3(p*vec2(70.0,120.0), 9.0));
+  float coal = smoothstep(0.50, 0.68, coalN) * coalMask * (0.4+0.6*fbmv(vec3(p*9.0, 13.0)));
+  float breathe = 0.6 + 0.4*fbmv(vec3(p*8.0, t*0.9));
+  vec3 coalCol = fireRamp(0.25 + 0.45*coal*breathe) * (0.7+0.8*breathe);
+  col = mix(col, coalCol, coal*0.6);
+  // deep glow
+  col += vec3(0.6,0.12,0.0)*coalMask*0.25*breathe;
+  return col;
+}
+
+// ---------- sparks ----------
+vec3 sparks(vec2 p, float t){
+  vec3 acc = vec3(0.0);
+  for(int i=0;i<36;i++){
+    float fi = float(i);
+    float life = 1.6 + 1.6*hash11(fi*1.3);
+    float phase = hash11(fi*7.7)*life;
+    float cyc = floor((t+phase)/life);
+    float lt = fract((t+phase)/life); // 0..1
+    float r0 = hash11(fi*3.3 + cyc*17.1);
+    float r1 = hash11(fi*5.9 + cyc*23.7);
+    float r2 = hash11(fi*9.1 + cyc*31.3);
+    vec2 start = vec2(-0.5 + r0*1.0, 0.18 + r1*0.15);
+    float rise = lt*(0.7+0.6*r2);
+    float wob = 0.05*sin(lt*12.0 + fi) + 0.04*sin(lt*23.0 + fi*2.7 + cyc);
+    vec2 pos = start + vec2(wob + 0.08*lt*(r1-0.5), rise);
+    float fade = (1.0-lt)*smoothstep(0.0,0.1,lt);
+    float d = length(p-pos);
+    float sz = 0.0022*(0.6+0.8*r2);
+    float dot_ = smoothstep(sz, 0.0, d) ;
+    float glow = sz*0.6/(d+0.004);
+    vec3 c = mix(vec3(1.0,0.35,0.05), vec3(1.0,0.75,0.3), r0);
+    float twinkle = 0.7+0.3*sin(t*40.0*(0.5+r1)+fi);
+    acc += c*(dot_*2.5 + glow*0.25)*fade*twinkle;
+  }
+  return acc;
+}
+
+// ---------- surround (stone mantel) ----------
+vec3 stone(vec2 uv, float light, float flash){
+  float n = fbmv(vec3(uv*14.0, 4.0));
+  float n2 = fbmv(vec3(uv*60.0, 8.0));
+  vec3 col = mix(vec3(0.16,0.14,0.13), vec3(0.28,0.25,0.22), n) * (0.75+0.5*n2);
+  return col*(0.12 + 0.9*light) + vec3(0.35,0.42,0.6)*flash*0.6*(0.5+0.5*n);
+}
+
+void main(){
+  vec2 uv = gl_FragCoord.xy/uRes;
+  float aspect = uRes.x/uRes.y;
+  float t = uTime;
+  // scene space: x centered [-aspect, aspect]*0.5 ; y [0,1]
+  vec2 p = vec2((uv.x-0.5)*aspect, uv.y);
+
+  // fireplace opening: rectangle with arch
+  vec2 openC = vec2(0.0, 0.42);
+  vec2 openHalf = vec2(0.66, 0.40);
+  float inOpen = -sdBox(p-openC, openHalf); // >0 inside
+  // arched top
+  float archD = length((p-vec2(0.0, 0.62))*vec2(1.0,1.6)) - 0.66;
+  inOpen = min(inOpen, -archD * step(0.62, p.y) + inOpen*step(p.y, 0.62));
+  float openMask = smoothstep(-0.003, 0.003, inOpen);
+
+  // heat shimmer (cheap: single low-octave noise)
+  float heatMask = smoothstep(0.12, 0.35, p.y)*(1.0-smoothstep(0.45,0.75,abs(p.x)));
+  vec2 shimmer = vec2(gnoise(vec3(p*vec2(30.0,18.0) + vec2(0.0,-t*1.5), t*2.0)), gnoise(vec3(p*vec2(30.0,18.0)+5.0 + vec2(0.0,-t*1.5), t*2.0+2.0))) * 0.0035 * heatMask;
+  vec2 pb = p + shimmer;
+
+  float light = fireLight(p, t);
+  float ao;
+  vec3 interior;
+  float floorY = 0.13;
+  if(pb.y < floorY){
+    vec2 fp = vec2(pb.x*(1.0 + (floorY-pb.y)*1.5), (floorY-pb.y)*3.0);
+    interior = emberBed(vec2(fp.x, fp.y*0.5), t, light*1.5);
+    interior *= 1.0 - 0.5*smoothstep(0.0, 0.12, floorY-pb.y);
+  } else {
+    vec2 wp = vec2(pb.x*1.08, (pb.y-floorY));
+    interior = brickWall(wp, light, t, ao);
+    interior *= (0.03 + light*1.05) * ao;
+    interior *= 0.55 + 0.45*smoothstep(0.9, 0.2, pb.y); // upper wall falls into darkness
+    interior *= 1.0 - 0.6*smoothstep(0.45, 0.66, abs(pb.x));
+  }
+  interior *= 1.0 - 0.4*smoothstep(0.55, 0.8, p.y);
+
+  vec3 col = interior;
+  vec4 L;
+  // rear logs
+  L = logShape(p, vec2(-0.42,0.28), vec2(0.35,0.30), 0.052, t, 1.0, light); col = mix(col, L.rgb, L.a);
+  L = logShape(p, vec2(-0.55,0.17), vec2(0.10,0.15), 0.060, t, 2.0, light); col = mix(col, L.rgb, L.a);
+  // back flames
+  bool fireZone = openMask > 0.0 && p.y < 1.0 && abs(p.x) < 0.72;
+  if(fireZone){ Flames FB = flamesBack(p, t); blendFlames(col, FB, 0.9); }
+  // front logs
+  L = logShape(p, vec2(0.02,0.14), vec2(0.60,0.19), 0.058, t, 3.0, light); col = mix(col, L.rgb, L.a);
+  L = logShape(p, vec2(-0.30,0.21), vec2(0.48,0.26), 0.048, t, 4.0, light); col = mix(col, L.rgb, L.a);
+  col *= 1.0 - 0.35*smoothstep(0.03, 0.0, abs(p.y-0.10))*(1.0-smoothstep(0.55,0.7,abs(p.x)));
+  // front flames
+  if(fireZone){ Flames FF = flamesFront(p, t); blendFlames(col, FF, 1.0); }
+
+  // sparks
+  col += sparks(p, t);
+
+  // interior glow / bloom approximation
+  float glowR = length((p-vec2(0.0,0.35))*vec2(1.0,1.2));
+  col += vec3(1.0,0.45,0.12)*0.20*flicker(t)/(1.0+12.0*glowR*glowR) * openMask;
+
+  // surround
+  vec3 surround = vec3(0.0);
+  if(openMask < 1.0) surround = stone(uv, light*0.9*(1.0-smoothstep(0.0,0.6,-inOpen)), uFlash);
+  // inner lip of the opening: dark stone frame
+  float lip = smoothstep(0.0, 0.05, -inOpen);
+  surround *= 0.5 + 0.5*lip;
+  // warm light spill onto surround
+  surround += vec3(1.0,0.5,0.18)*0.25*flicker(t)*exp(-max(-inOpen,0.0)*6.0);
+  col = mix(surround, col, openMask);
+
+  // lightning flash: cool ambient bump (window off-screen)
+  col += vec3(0.20,0.26,0.40)*uFlash*(0.25+0.5*(1.0-openMask))*(0.6+0.4*uv.y);
+
+  // vignette & tone
+  float vig = 1.0 - 0.55*pow(length((uv-0.5)*vec2(1.0,1.15)),2.2);
+  col *= vig;
+  col = col/(1.0+col*0.35); // gentle tonemap
+  col = pow(max(col,0.0), vec3(0.95));
+  // fine grain
+  col += (hash12(gl_FragCoord.xy + fract(t)*100.0)-0.5)*0.008;
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+<script>
+const canvas = document.getElementById('c');
+let gl, prog, uRes, uTime, uFlash;
+function init(w,h){
+  canvas.width=w; canvas.height=h;
+  gl = canvas.getContext('webgl', {preserveDrawingBuffer:true, antialias:false, alpha:false});
+  if(!gl) throw new Error('no webgl');
+  const mk=(t,s)=>{const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(sh));return sh;};
+  prog=gl.createProgram();
+  gl.attachShader(prog,mk(gl.VERTEX_SHADER,document.getElementById('vs').text));
+  gl.attachShader(prog,mk(gl.FRAGMENT_SHADER,document.getElementById('fs').text));
+  gl.linkProgram(prog); if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  const a=gl.getAttribLocation(prog,'a'); gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);
+  uRes=gl.getUniformLocation(prog,'uRes'); uTime=gl.getUniformLocation(prog,'uTime'); uFlash=gl.getUniformLocation(prog,'uFlash');
+  gl.viewport(0,0,w,h); gl.uniform2f(uRes,w,h);
+  return gl.getParameter(gl.RENDERER);
+}
+function render(t, flash){
+  gl.uniform1f(uTime,t); gl.uniform1f(uFlash,flash||0);
+  gl.drawArrays(gl.TRIANGLES,0,3); gl.finish();
+}
+function frame(t, flash, q){
+  render(t, flash);
+  return canvas.toDataURL('image/jpeg', q||0.95).split(',')[1];
+}
+let c2, ctx2;
+function frameBlend(tA, tB, w, q){
+  if(!c2){ c2=document.createElement('canvas'); c2.width=canvas.width; c2.height=canvas.height; ctx2=c2.getContext('2d'); }
+  render(tA, 0); ctx2.globalAlpha=1; ctx2.drawImage(canvas,0,0);
+  render(tB, 0); ctx2.globalAlpha=w; ctx2.drawImage(canvas,0,0);
+  return c2.toDataURL('image/jpeg', q||0.95).split(',')[1];
+}
+window.__frameBlend=frameBlend; window.__init=init; window.__frame=frame; window.__render=render;
+</script></body></html>
